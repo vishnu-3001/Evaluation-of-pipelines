@@ -29,12 +29,12 @@ def get_stats():
     stats=index.describe_index_stats(namespace=namespace)
     return stats
 
+vectors=[]
 def get_data():
     stats = get_stats()
     if stats.get("total_vector_count", 0) == 0:
         with open('train-v2.0.json', 'r') as f:
             data = json.load(f)
-        vectors=[]
         for article in data['data']:
             title=article['title']
             for p_idx,para in enumerate(article['paragraphs']):
@@ -54,10 +54,6 @@ def get_data():
                     "values":context_embedding,
                     "metadata":metadata,
                 })
-        # size=100
-        # for i in range(0,len(vectors),size):
-        #     print(i)
-        #     index.upsert(vectors[i:i+size],namespace=namespace)
     print("Data inserted successfully")
     return vectors
 
