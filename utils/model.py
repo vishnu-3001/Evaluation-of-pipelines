@@ -16,8 +16,8 @@ def get_model():
         temperature=0,
     )
 
-def get_embedding_model():
-    return OpenAIEmbeddings(
-        model="text-embedding-3-large",
-        openai_api_key=open_ai_key      
-    )
+# def get_embedding_model():
+#     return OpenAIEmbeddings(
+#         model="text-embedding-3-large",
+#         openai_api_key=open_ai_key      
+#     )

@@ -10,7 +10,7 @@ async def api_response(req:Request):
         query=body.get("query")
         if not query:
             raise HTTPException(status_code=400,detail="Query parameter is required")
-        result=call_llm(query)
+        result=await call_llm(query)
         return JSONResponse(content={"response":result})
     except Exception as e:
         raise HTTPException(status_code=500,detail=str(e))
@@ -22,7 +22,7 @@ async def rag_response(req:Request):
         query=body.get("query")
         if not query:
             raise HTTPException(status_code=400,detail="Query parameter is required")
-        result=call_rag(query)
+        result=await call_rag(query)
         return JSONResponse(content={"response":result})
     except Exception as e:
         raise HTTPException(status_code=500,detail=str(e))

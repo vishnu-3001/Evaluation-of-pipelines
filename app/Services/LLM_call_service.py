@@ -6,7 +6,11 @@ from utils import *;
 from langchain_pinecone import PineconeVectorStore
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains.retrieval import create_retrieval_chain
-from sentence_transformers import SentenceTransformer
+from langgraph.graph import StateGraph,END
+from typing import TypedDict
+from langchain_community.embeddings import SentenceTransformerEmbeddings
+
+
 
 # uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
@@ -18,7 +22,7 @@ pinecone_api_key=os.getenv("PINECONE_API_KEY")
 pinecone_environment=os.getenv("PINECONE_ENVIRONMENT")
 index_name=os.getenv("PINECONE_INDEX_NAME")
 namespace=os.getenv("PINECONE_NAMESPACE")
-embedding_model = SentenceTransformer("BAAI/bge-large-en-v1.5")
+embedding_model = SentenceTransformerEmbeddings(model_name="BAAI/bge-large-en-v1.5")
 
 vectorstore = PineconeVectorStore(
     index_name=index_name,
@@ -38,15 +42,17 @@ async def call_llm(question):
             template=prompt_template,
         )
         chain=prompt|model
-        response=await chain.invoke({"question":question})
-        output=response.content().strip().lower() if hasattr(response, "content") else "No response from model"
+        response=await chain.ainvoke({"question":question})
+        # print(response)
+        output=response.content.strip().lower() if hasattr(response, "content") else "No response from model"
+        print(output)
         return output
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 async def call_rag(question):
     try:
         prompt_template = """
-    You are a helpful AI assistant. Use the following retrieved context to answer the user's question.
+    You are a helpful AI assistant. Use the following retrieved context to answer the user's question.Dont make the answer if you donet know, dont hallucinate, just say that you dont now or you are unable to get the answer.
 
     Context:
     {context}
@@ -62,10 +68,66 @@ async def call_rag(question):
         )
         document_chain = create_stuff_documents_chain(model, prompt)
         rag_chain = create_retrieval_chain(retriever, document_chain)
-        result = await rag_chain.invoke({"input": question})
-        output=result.content().strip().lower() if hasattr(result, "content") else "No response from model"
+        result = await rag_chain.ainvoke({"input": question})
+        output=result.content.strip().lower() if hasattr(result, "content") else "No response from model"
         return output
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-def call_agent(question):
-    return "hello"
+    
+
+class AgentState(TypedDict):
+    question: str
+    context: str
+    answer: str
+
+
+agent_prompt_template = """
+You are a helpful AI assistant. Use the following retrieved context to answer the user's question. 
+Don't make the answer if you don't know; don't hallucinate. Just say that you don't know or are unable to get the answer.
+
+Context:
+{context}
+
+Question:
+{input}
+
+Answer clearly and concisely:
+"""
+agent_prompt = PromptTemplate(
+    input_variables=["input", "context"],
+    template=agent_prompt_template,
+)
+
+def retrieve_context(state: AgentState) -> AgentState:
+    query = state["question"]
+    docs = retriever.get_relevant_documents(query)
+    state["context"] = "\n\n".join([doc.page_content for doc in docs])
+    return state
+
+def generate_answer(state: AgentState) -> AgentState:
+    question = state["question"]
+    context = state["context"]
+    chain = agent_prompt | model 
+    result = chain.invoke({"question": question, "context": context})
+    state["answer"] = result.content
+    return state
+
+# ❌ remove the old `state_schema` dict entirely
+
+# ✅ Proper LangGraph construction
+graph = StateGraph(AgentState)
+graph.add_node("retrieve", retrieve_context)
+graph.add_node("generate", generate_answer)
+graph.set_entry_point("retrieve")
+graph.add_edge("retrieve", "generate")
+graph.add_edge("generate", END)
+
+rag_agent = graph.compile()
+def call_agent(question: str):
+    inputs = {"question": question}
+    result = rag_agent.invoke(inputs)
+    return {
+        "question": question,
+        "answer": result["answer"],
+        "context": result["context"]
+    }
