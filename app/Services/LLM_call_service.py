@@ -10,6 +10,7 @@ from langgraph.graph import StateGraph,END
 from typing import TypedDict
 from langchain_community.embeddings import SentenceTransformerEmbeddings
 from .metrics import evaluate_hallucination
+from langchain.callbacks import get_openai_callback
 
 
 
@@ -44,8 +45,15 @@ async def call_llm(question):
             template=prompt_template,
         )
         chain=prompt|model
-        response=await chain.ainvoke({"question":question})
-        output=response.content.strip().lower() if hasattr(response, "content") else "No response from model"
+        with get_openai_callback() as cb:
+            response=await chain.ainvoke({"question":question})
+            output=response.content.strip().lower() if hasattr(response, "content") else "No response from model"
+        token_data={
+                "prompt_tokens": cb.prompt_tokens,
+                "completion_tokens": cb.completion_tokens,
+                "total_tokens": cb.total_tokens,
+                "total_cost": cb.total_cost
+            }
         return output
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -71,11 +79,18 @@ async def call_rag(question):
             """
             prompt = PromptTemplate(input_variables=["input", "context"], template=prompt_template)
             document_chain = create_stuff_documents_chain(model, prompt)
-            result = await document_chain.ainvoke({"input": question, "context": docs})
-            output = result.content.strip() if hasattr(result, "content") else str(result)
+            with get_openai_callback() as cb:
+                result = await document_chain.ainvoke({"input": question, "context": docs})
+                output = result.content.strip() if hasattr(result, "content") else str(result)
             extracted_content=[]
             for doc in docs:
                 extracted_content.append(doc.page_content)
+            token_data={
+                "prompt_tokens": cb.prompt_tokens,
+                "completion_tokens": cb.completion_tokens,
+                "total_tokens": cb.total_tokens,
+                "total_cost": cb.total_cost
+            }
             # metrics=evaluate_hallucination(output,original_answer,extracted_content,original_content)
             return output
         except Exception as e:
@@ -170,7 +185,15 @@ rag_agent = graph.compile()
 
 def call_agent(question: str):
     inputs = {"question": question, "context": "", "answer": ""}
-    result = rag_agent.invoke(inputs)
+    with get_openai_callback() as cb:
+        result = rag_agent.invoke(inputs)
+    token_data={
+        "prompt_tokens": cb.prompt_tokens,
+        "completion_tokens": cb.completion_tokens,
+        "total_tokens": cb.total_tokens,
+        "total_cost": cb.total_cost
+    }
+    print(token_data)   
     return {
         "question": question,
         "answer": result["answer"],
