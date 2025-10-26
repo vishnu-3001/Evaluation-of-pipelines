@@ -1,6 +1,7 @@
 from fastapi import APIRouter,HTTPException,Request
 from fastapi.responses import JSONResponse
 from app.Services import *
+import time
 llm_router=APIRouter()
 
 @llm_router.post("/api")
@@ -22,7 +23,10 @@ async def rag_response(req:Request):
         query=body.get("query")
         if not query:
             raise HTTPException(status_code=400,detail="Query parameter is required")
+        start=time.time()
         result=await call_rag(query)
+        end=time.time()
+        latency=end-start
         return JSONResponse(content={"response":result})
     except Exception as e:
         raise HTTPException(status_code=500,detail=str(e))

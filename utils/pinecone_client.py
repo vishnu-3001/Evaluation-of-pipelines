@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import uuid
 from langchain_community.embeddings import SentenceTransformerEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 
 
@@ -29,33 +30,51 @@ def get_stats():
     stats=index.describe_index_stats(namespace=namespace)
     return stats
 
+
 vectors=[]
 def get_data():
     stats = get_stats()
+    vectors = []
+
     if stats.get("total_vector_count", 0) == 0:
         with open('train-v2.0.json', 'r') as f:
             data = json.load(f)
+
+        splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=50)
+
         for article in data['data']:
             title = article['title']
             for p_idx, para in enumerate(article['paragraphs']):
-                print(p_idx)
+                print("creating vector ",p_idx)
                 context = para['context']
-                context_embedding = embedding_model.embed_query(context)
-                metadata = {
-                    "title": title,
-                    "context": context,
-                    "questions": [q["question"] for q in para["qas"]],
-                    "answers": [a["text"] for q in para["qas"] for a in q["answers"]],
-                    "is_impossible": [str(q["is_impossible"]) for q in para["qas"]],
-                }
-                vector_id = str(uuid.uuid4())
-                vectors.append({
-                    "id": vector_id,
-                    "values": context_embedding,
-                    "metadata": metadata,
-                })
-    print("Data inserted successfully")
+                chunks = splitter.split_text(context)
+
+                for chunk_idx, chunk in enumerate(chunks):
+                    # ✅ Correct: use embed_documents for docs
+                    context_embedding = embedding_model.embed_documents([chunk])[0]
+
+                    metadata = {
+                        "title": title,
+                        "chunk_id": f"{p_idx}_{chunk_idx}",
+                        "text": chunk,
+                        "questions": [q["question"] for q in para["qas"]],
+                        "answers": [a["text"] for q in para["qas"] for a in q["answers"]],
+                        "is_impossible": [str(q["is_impossible"]) for q in para["qas"]],
+                    }
+
+                    vector_id = str(uuid.uuid4())
+                    vectors.append({
+                        "id": vector_id,
+                        "values": context_embedding,
+                        "metadata": metadata,
+                    })
+
+        print(f"✅ Inserted {len(vectors)} document vectors successfully")
+    else:
+        print("Vectors already exist in DB")
+
     return vectors
+
 
 vectors=get_data()
 size=100
