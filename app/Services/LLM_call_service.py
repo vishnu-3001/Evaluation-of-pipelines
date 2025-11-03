@@ -11,6 +11,8 @@ from typing import TypedDict
 from langchain_community.embeddings import SentenceTransformerEmbeddings
 from .metrics import evaluate_hallucination
 from langchain.callbacks import get_openai_callback
+from typing import TypedDict, Optional, Dict, Any
+
 
 
 
@@ -35,81 +37,259 @@ vectorstore = PineconeVectorStore(
 
 retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
 
-async def call_llm(question):
-    try:
-        prompt_template = """You are a helpful assistant. Use the following pieces of context to answer the question at the end. If you don't know the answer, just say that you don't know, don't try to make up an answer.
-        Question: {{question}}
-        Helpful Answer:"""
-        prompt = PromptTemplate(
-            input_variables=["question"],
-            template=prompt_template,
-        )
-        chain=prompt|model
-        with get_openai_callback() as cb:
-            response=await chain.ainvoke({"question":question})
-            output=response.content.strip().lower() if hasattr(response, "content") else "No response from model"
-        token_data={
-                "prompt_tokens": cb.prompt_tokens,
-                "completion_tokens": cb.completion_tokens,
-                "total_tokens": cb.total_tokens,
-                "total_cost": cb.total_cost
-            }
-        return output
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-async def call_rag(question):
-        original_answer="John F. Kennedy"
-        original_content="The Apollo program was the third United States human spaceflight program carried out by NASA, which accomplished landing the first humans on the Moon from 1969 to 1972. First conceived during Dwight D. Eisenhower's administration as a three-person spacecraft to follow the one-person Project Mercury, which put the first Americans in space, Apollo was later dedicated to President John F. Kennedy's national goal of landing a man on the Moon and returning him safely to the Earth by the end of the 1960s, which he proposed in an address to Congress on May 25, 1961."
-        try:
-            docs = []
-            try:
-                docs = await retriever.aget_relevant_documents(question)
-            except Exception as e_async:
-                try:
-                    docs = retriever.get_relevant_documents(question)
-                except Exception as e_sync:
-                    raise e_sync
-            prompt_template = """
-            You are a helpful AI assistant. Use the following retrieved context to answer the user's question.
-            Context:
-            {context}
-            Question:
-            {input}
-            Answer:
-            """
-            prompt = PromptTemplate(input_variables=["input", "context"], template=prompt_template)
-            document_chain = create_stuff_documents_chain(model, prompt)
-            with get_openai_callback() as cb:
-                result = await document_chain.ainvoke({"input": question, "context": docs})
-                output = result.content.strip() if hasattr(result, "content") else str(result)
-            extracted_content=[]
-            for doc in docs:
-                extracted_content.append(doc.page_content)
-            token_data={
-                "prompt_tokens": cb.prompt_tokens,
-                "completion_tokens": cb.completion_tokens,
-                "total_tokens": cb.total_tokens,
-                "total_cost": cb.total_cost
-            }
-            # metrics=evaluate_hallucination(output,original_answer,extracted_content,original_content)
-            return output
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"RAG processing error: {str(e)}")
-    
 
+verification_prompt_template = """
+You are an expert verifier. Your task is to assess whether the 'Generated Answer' is supported by the 'Context' for the given 'Question'.
+
+Please:
+1. Analyze if the Generated Answer is correct and supported by the context.
+2. Provide your reasoning concisely in 1–3 sentences.
+3. If it is unsupported, state *why* (missing evidence, contradicts context, etc.).
+
+Output format:
+Reason:
+<your reasoning>
+
+Context:
+{context}
+
+Question:
+{question}
+
+Generated Answer:
+{answer}
+
+Final Output:
+Reason:
+"""
+
+
+# ----------------------------- LLM Call -----------------------------
+async def call_llm(context: str, question: str):
+    try:
+        # === GENERATION PHASE ===
+        gen_prompt = PromptTemplate(
+            input_variables=["context", "question"],
+            template="""
+You are a helpful assistant.
+You are given a passage and a question from a reading comprehension dataset.
+Answer the question *only* using the passage below.
+If you don’t know the answer from the passage, say “I don’t know.”
+
+Passage:
+{context}
+
+Question:
+{question}
+
+Answer:
+"""
+        )
+        gen_chain = gen_prompt | model
+
+        with get_openai_callback() as cb_gen:
+            gen_response = await gen_chain.ainvoke({"context": context, "question": question})
+            answer = gen_response.content.strip() if hasattr(gen_response, "content") else "No response from model"
+
+        generate_tokens = {
+            "prompt_tokens": cb_gen.prompt_tokens,
+            "completion_tokens": cb_gen.completion_tokens,
+            "total_tokens": cb_gen.total_tokens,
+            "total_cost": cb_gen.total_cost
+        }
+
+        # === VERIFICATION PHASE ===
+        verify_prompt = PromptTemplate.from_template(verification_prompt_template)
+        verify_chain = verify_prompt | model
+
+        with get_openai_callback() as cb_ver:
+            verify_result = await verify_chain.ainvoke({
+                "context": context,
+                "question": question,
+                "answer": answer
+            })
+            reason = verify_result.content.strip() if hasattr(verify_result, "content") else "No verification response"
+
+        verify_tokens = {
+            "prompt_tokens": cb_ver.prompt_tokens,
+            "completion_tokens": cb_ver.completion_tokens,
+            "total_tokens": cb_ver.total_tokens,
+            "total_cost": cb_ver.total_cost
+        }
+
+        return {
+            "response": answer,
+            "reason": reason,
+            "context": context,
+            "token_data": {
+                "generate": generate_tokens,
+                "verify": verify_tokens
+            }
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM error: {str(e)}")
+
+
+# ----------------------------- RAG Call -----------------------------
+async def call_rag(question):
+    try:
+        # === RETRIEVE DOCUMENTS ===
+        docs = []
+        try:
+            docs = await retriever.aget_relevant_documents(question)
+        except Exception:
+            docs = retriever.get_relevant_documents(question)
+
+        context = "\n\n".join([doc.page_content for doc in docs])
+
+        # === GENERATION PHASE ===
+        gen_prompt = PromptTemplate(
+            input_variables=["input", "context"],
+            template=agent_prompt_template
+        )
+        document_chain = create_stuff_documents_chain(model, gen_prompt)
+
+        with get_openai_callback() as cb_gen:
+            gen_result = await document_chain.ainvoke({"input": question, "context": docs})
+            answer = gen_result.content.strip() if hasattr(gen_result, "content") else str(gen_result)
+
+        generate_tokens = {
+            "prompt_tokens": cb_gen.prompt_tokens,
+            "completion_tokens": cb_gen.completion_tokens,
+            "total_tokens": cb_gen.total_tokens,
+            "total_cost": cb_gen.total_cost
+        }
+
+        # === VERIFICATION PHASE ===
+        verify_prompt = PromptTemplate.from_template(verification_prompt_template)
+        verify_chain = verify_prompt | model
+
+        with get_openai_callback() as cb_ver:
+            verify_result = await verify_chain.ainvoke({
+                "context": context,
+                "question": question,
+                "answer": answer
+            })
+            reason = verify_result.content.strip() if hasattr(verify_result, "content") else "No verification response"
+
+        verify_tokens = {
+            "prompt_tokens": cb_ver.prompt_tokens,
+            "completion_tokens": cb_ver.completion_tokens,
+            "total_tokens": cb_ver.total_tokens,
+            "total_cost": cb_ver.total_cost
+        }
+
+        return {
+            "response": answer,
+            "reason": reason,
+            "context": [doc.page_content for doc in docs],
+            "token_data": {
+                "generate": generate_tokens,
+                "verify": verify_tokens
+            }
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"RAG processing error: {str(e)}")
+
+# async def call_llm(context: str, question: str):
+#     try:
+#         prompt_template = """
+# You are a helpful assistant.
+# You are given a passage and a question from a reading comprehension dataset.
+# Answer the question *only* using the passage below.
+# If you don’t know the answer from the passage, say “I don’t know.”
+
+# Passage:
+# {context}
+
+# Question:
+# {question}
+
+# Answer:
+# """
+#         prompt = PromptTemplate(
+#             input_variables=["context", "question"],
+#             template=prompt_template,
+#         )
+
+#         chain = prompt | model
+
+#         with get_openai_callback() as cb:
+#             response = await chain.ainvoke({"context": context, "question": question})
+#             output = response.content.strip() if hasattr(response, "content") else "No response from model"
+
+#         token_data = {
+#             "prompt_tokens": cb.prompt_tokens,
+#             "completion_tokens": cb.completion_tokens,
+#             "total_tokens": cb.total_tokens,
+#             "total_cost": cb.total_cost
+#         }
+#         # print({"response":output,"token_usage":token_data})
+
+#         return {
+#             "response": output,
+#             "token_usage": token_data
+#         }
+
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
+# async def call_rag(question):
+#         try:
+#             docs = []
+#             try:
+#                 docs = await retriever.aget_relevant_documents(question)
+#             except Exception as e_async:
+#                 try:
+#                     docs = retriever.get_relevant_documents(question)
+#                 except Exception as e_sync:
+#                     raise e_sync
+#             prompt_template = """
+#             You are a helpful AI assistant. Use the following retrieved context to answer the user's question.
+#             Context:
+#             {context}
+#             Question:
+#             {input}
+#             Answer:
+#             """
+#             prompt = PromptTemplate(input_variables=["input", "context"], template=prompt_template)
+#             document_chain = create_stuff_documents_chain(model, prompt)
+#             with get_openai_callback() as cb:
+#                 result = await document_chain.ainvoke({"input": question, "context": docs})
+#                 output = result.content.strip() if hasattr(result, "content") else str(result)
+#             extracted_content=[]
+#             for doc in docs:
+#                 extracted_content.append(doc.page_content)
+#             token_data={
+#                 "prompt_tokens": cb.prompt_tokens,
+#                 "completion_tokens": cb.completion_tokens,
+#                 "total_tokens": cb.total_tokens,
+#                 "total_cost": cb.total_cost
+#             }
+#             return {
+#                 "response": output,
+#                 "context": extracted_content,
+#                 "token_usage": token_data
+#             }
+#         except Exception as e:
+#             raise HTTPException(status_code=500, detail=f"RAG processing error: {str(e)}")
+    
 
 
 class AgentState(TypedDict):
     question: str
     context: str
     answer: str
+    reason: str
+    docs: Optional[list]
+    generate_tokens: Optional[Dict[str, Any]]
+    verify_tokens: Optional[Dict[str, Any]]
+
+
 
 agent_prompt_template = """
-You are a helpful and careful AI assistant.
-
-Use the following context to answer the user's question. If the answer can be determined or strongly inferred from the context, answer directly and concisely.
-
-If the context does not contain enough information, respond with: "I'm sorry, I don't have enough information to answer that."
+You are a helpful AI assistant. Use the following retrieved context to answer the user's question.
 
 Context:
 {context}
@@ -121,14 +301,16 @@ Answer:
 """
 
 verification_prompt_template = """
-You are an expert answer verifier. Your task is to check if the 'Generated Answer' is fully supported by the 'Context' for the 'Question'.
+You are an expert verifier. Your task is to assess whether the 'Generated Answer' is supported by the 'Context' for the given 'Question'.
 
-1. If the 'Generated Answer' is fully supported by the context, output ONLY the 'Generated Answer' text.
-2. If the 'Generated Answer' is:
-    a) The refusal phrase ("I'm sorry, I don't have enough information to answer that."), OR
-    b) Contains information not in the context (a hallucination), OR
-    c) Incorrect based on the context,
-   ...then your final output must be ONLY the refusal phrase: "I'm sorry, I don't have enough information to answer that."
+Please:
+1. Analyze if the Generated Answer is correct and supported by the context.
+2. Provide your reasoning concisely in 1–3 sentences.
+3. If it is unsupported, state *why* (missing evidence, contradicts context, etc.).
+
+Output format:
+Reason:
+<your reasoning>
 
 Context:
 {context}
@@ -139,37 +321,63 @@ Question:
 Generated Answer:
 {answer}
 
-Final Verified Answer:
+Final Output:
+Reason:
 """
+
 
 def retrieve_context(state: AgentState) -> AgentState:
     query = state["question"]
     docs = retriever.get_relevant_documents(query)
+    state["docs"]=docs
     state["context"] = "\n\n".join([doc.page_content for doc in docs])
     return state
+
 
 def generate_answer(state: AgentState) -> AgentState:
     question = state["question"]
     context = state["context"]
+
     prompt = PromptTemplate.from_template(agent_prompt_template)
     chain = prompt | model
-    result = chain.invoke({"context": context, "input": question})
-    state["answer"] = result.content
+
+    with get_openai_callback() as cb:
+        result = chain.invoke({"context": context, "input": question})
+        state["answer"] = result.content
+        state["generate_tokens"] = {
+            "prompt_tokens": cb.prompt_tokens,
+            "completion_tokens": cb.completion_tokens,
+            "total_tokens": cb.total_tokens,
+            "total_cost": cb.total_cost
+        }
+
     return state
+
 
 def verify_answer(state: AgentState) -> AgentState:
     question = state["question"]
     context = state["context"]
     initial_answer = state["answer"]
+
     prompt = PromptTemplate.from_template(verification_prompt_template)
     chain = prompt | model
-    verified_content = chain.invoke({
-        "context": context,
-        "question": question,
-        "answer": initial_answer
-    })
-    state["answer"] = verified_content.content.strip()
+
+    with get_openai_callback() as cb:
+        result = chain.invoke({
+            "context": context,
+            "question": question,
+            "answer": initial_answer
+        })
+        state["reason"] = result.content.strip()
+        state["verify_tokens"] = {
+            "prompt_tokens": cb.prompt_tokens,
+            "completion_tokens": cb.completion_tokens,
+            "total_tokens": cb.total_tokens,
+            "total_cost": cb.total_cost
+        }
+
     return state
+
 
 graph = StateGraph(AgentState)
 graph.add_node("retrieve", retrieve_context)
@@ -183,20 +391,22 @@ graph.add_edge("verify", END)
 
 rag_agent = graph.compile()
 
+
 def call_agent(question: str):
-    inputs = {"question": question, "context": "", "answer": ""}
-    with get_openai_callback() as cb:
-        result = rag_agent.invoke(inputs)
-    token_data={
-        "prompt_tokens": cb.prompt_tokens,
-        "completion_tokens": cb.completion_tokens,
-        "total_tokens": cb.total_tokens,
-        "total_cost": cb.total_cost
+    inputs = {"question": question, "context": "", "answer": "", "reason": "", "docs": []}
+    result = rag_agent.invoke(inputs)
+
+    token_data = {
+        "generate_node": result.get("generate_tokens", {}),
+        "verify_node": result.get("verify_tokens", {})
     }
-    print(token_data)   
+
+    extracted_content = [doc.page_content for doc in result.get("docs", []) or []]
+
     return {
-        "question": question,
-        "answer": result["answer"],
-        "context": result["context"]
+        "response": result.get("answer", ""),
+        "context": extracted_content,
+        "reason": result.get("reason", ""),
+        "token_data": token_data
     }
 
