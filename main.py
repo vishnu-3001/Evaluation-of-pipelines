@@ -67,6 +67,6 @@ def llm_agent():
 
 if __name__=="__main__":
     # uvicorn.run("main:app",host="0.0.0.0",port=8000,reload=True)
-    asyncio.run(llm_api())
+    # asyncio.run(llm_api())
     # asyncio.run(llm_rag())
-    # llm_agent()    
+    llm_agent()    
